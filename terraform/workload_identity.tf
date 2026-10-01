@@ -38,5 +38,11 @@ resource "azurerm_federated_identity_credential" "github_main" {
   parent_id = azurerm_user_assigned_identity.github_actions.id
   audience  = ["api://AzureADTokenExchange"]
   issuer    = "https://token.actions.githubusercontent.com"
-  subject   = "repo:${var.github_owner}/${var.github_repo_name}:ref:refs/heads/main"
+  # GitHub now issues OIDC subjects that include the immutable numeric owner
+  # and repository IDs, e.g. repo:JasSin155@280837182/koalatech-hd@1398931302:...
+  # The first pipeline run failed with AADSTS700213 against the old name-only
+  # subject, so the trust is pinned to the exact claim GitHub presents. This is
+  # also stricter: a deleted and re-created repo with the same name gets a new
+  # ID and therefore no Azure access.
+  subject = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo_name}@${var.github_repo_id}:ref:refs/heads/main"
 }

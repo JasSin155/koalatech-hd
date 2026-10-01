@@ -15,6 +15,15 @@ resource "azurerm_kubernetes_cluster" "aks" {
     node_count = var.aks_node_count
     vm_size    = var.aks_node_vm_size
     max_pods   = 50
+
+    # Declared explicitly to match the defaults Azure applies at creation.
+    # Without this block every later plan shows drift and tries to null them,
+    # which would trigger a needless node pool update on the live cluster.
+    upgrade_settings {
+      max_surge                     = "10%"
+      drain_timeout_in_minutes      = 0
+      node_soak_duration_in_minutes = 0
+    }
   }
 
   identity {

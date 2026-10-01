@@ -63,6 +63,18 @@ variable "github_owner" {
   default = "JasSin155"
 }
 
+variable "github_owner_id" {
+  description = "Immutable numeric GitHub account ID (appears in the OIDC subject claim)"
+  type        = string
+  default     = "280837182"
+}
+
+variable "github_repo_id" {
+  description = "Immutable numeric GitHub repository ID of koalatech-hd"
+  type        = string
+  default     = "1398931302"
+}
+
 variable "github_repo_name" {
   description = "App repository whose main branch may push images"
   type        = string
