@@ -1,0 +1,242 @@
+name: CI - build, scan, publish to GitOps
+
+# Task 10.3HD pipeline.
+#
+# What changed compared with week08:
+#   * No job in this workflow can reach the AKS cluster or Key Vault. The last
+#     job only commits a new image tag to the koalatech-gitops repository,
+#     and Argo CD (inside the cluster) pulls that change and deploys it.
+#   * Azure login uses GitHub OIDC federated to a user-assigned managed
+#     identity that only holds AcrPush. There is no AZURE_CREDENTIALS client
+#     secret in this repository.
+#   * Two security gates must pass before anything is pushed: checkov on the
+#     Terraform module and Docker Scout on every image.
+#   * Pull requests run the tests and both gates but never push or deploy.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ===========================================================
+  # Gate 1: static security scan of the Terraform module
+  # ===========================================================
+  terraform-scan:
+    name: Terraform security scan (checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checkov
+        run: pip install "checkov==3.3.20"
+
+      # .checkov.yaml lists every accepted finding with its reason. Anything
+      # else is a hard failure, which blocks build-scan-push via `needs`.
+      - name: Run checkov
+        run: |
+          checkov -d terraform --config-file .checkov.yaml \
+            --output cli --output sarif --output-file-path console,results
+
+      - name: Upload SARIF to the Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results/results_sarif.sarif
+
+  # ===========================================================
+  # Unit tests (unchanged from week08)
+  # ===========================================================
+  backend-test:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { service: user-service,       database: users,       port: 5433 }
+          - { service: student-service,    database: students,    port: 5434 }
+          - { service: lecturer-service,   database: lecturers,   port: 5435 }
+          - { service: course-service,     database: courses,     port: 5436 }
+          - { service: enrollment-service, database: enrollments, port: 5437 }
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ matrix.database }}
+        ports:
+          - ${{ matrix.port }}:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d ${{ matrix.database }}"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      # Throwaway values for the ephemeral CI database only.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${{ matrix.database }}
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: ${{ matrix.port }}
+      JWT_SECRET_KEY: koalatech-ci-test-secret
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+      DEFAULT_ADMIN_USERNAME: admin
+      DEFAULT_ADMIN_EMAIL: admin@koalatech.edu.au
+      DEFAULT_ADMIN_PASSWORD: AdminPassword123!
+      AZURE_STORAGE_CONNECTION_STRING: ""
+      AZURE_STORAGE_CONTAINER_NAME: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run tests
+        working-directory: ${{ matrix.service }}
+        run: pytest -v
+
+  # ===========================================================
+  # Gate 2: build, Docker Scout scan, and (main only) push
+  # ===========================================================
+  build-scan-push:
+    name: Build and scan ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [terraform-scan, backend-test]
+    permissions:
+      contents: read
+      id-token: write   # lets this job request a GitHub OIDC token for Azure
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { service: frontend,           image: koalatech-frontend }
+          - { service: user-service,       image: koalatech-user-service }
+          - { service: student-service,    image: koalatech-student-service }
+          - { service: lecturer-service,   image: koalatech-lecturer-service }
+          - { service: course-service,     image: koalatech-course-service }
+          - { service: enrollment-service, image: koalatech-enrollment-service }
+    env:
+      IMAGE_REF: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+      IS_MAIN_PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --platform linux/amd64 -t "$IMAGE_REF" ./${{ matrix.service }}
+
+      - name: Log in to Docker Hub (Docker Scout authentication only)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Same gate settings proven in Task 10.2D: fail on critical/high
+      # findings that HAVE a fix available. Without only-fixed the gate blocks
+      # forever on OS CVEs Debian has not patched yet.
+      - name: Docker Scout gate
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ env.IMAGE_REF }}
+          only-severities: critical,high
+          only-fixed: "true"
+          exit-code: "1"
+
+      # Everything below runs only for a push to main. Pull requests stop here.
+      - name: Azure login (OIDC, no client secret)
+        if: env.IS_MAIN_PUSH == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
+
+      # Exchange the Azure AD token for an ACR token directly, so the push
+      # needs nothing beyond the AcrPush role on this one registry.
+      - name: Log in to ACR with the federated identity
+        if: env.IS_MAIN_PUSH == 'true'
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          AAD_TOKEN=$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)
+          ACR_REFRESH=$(curl -sf -X POST "https://${ACR}/oauth2/exchange" \
+            -d grant_type=access_token -d service="${ACR}" -d access_token="${AAD_TOKEN}" | jq -r .refresh_token)
+          echo "::add-mask::${ACR_REFRESH}"
+          echo "${ACR_REFRESH}" | docker login "${ACR}" -u 00000000-0000-0000-0000-000000000000 --password-stdin
+
+      - name: Push image
+        if: env.IS_MAIN_PUSH == 'true'
+        run: docker push "$IMAGE_REF"
+
+  # ===========================================================
+  # Hand-off to GitOps: commit the new image tags, Argo CD deploys
+  # ===========================================================
+  update-gitops:
+    name: Update image tags in koalatech-gitops
+    runs-on: ubuntu-latest
+    needs: [build-scan-push]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: gitops-write
+      cancel-in-progress: false
+    steps:
+      - name: Check out the GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/koalatech-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Install kustomize
+        run: |
+          curl -sSL -o k.tgz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+          tar xzf k.tgz && sudo mv kustomize /usr/local/bin/ && kustomize version
+
+      - name: Set new image tags
+        working-directory: gitops/manifests
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+          TAG: ${{ github.sha }}
+        run: |
+          for img in frontend user-service student-service lecturer-service course-service enrollment-service; do
+            kustomize edit set image "koalatech-${img}=${ACR}/koalatech-${img}:${TAG}"
+          done
+          git diff
+
+      - name: Commit and push
+        working-directory: gitops
+        run: |
+          git config user.name  "koalatech-ci[bot]"
+          git config user.email "koalatech-ci@users.noreply.github.com"
+          git add manifests/kustomization.yaml
+          if git diff --cached --quiet; then
+            echo "Image tags already up to date"; exit 0
+          fi
+          git commit -m "deploy: koalatech images ${GITHUB_SHA::7} (from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7})"
+          git push

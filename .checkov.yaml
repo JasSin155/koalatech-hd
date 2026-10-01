@@ -1,0 +1,47 @@
+# checkov configuration for the terraform-scan CI gate (Task 10.3HD).
+#
+# Any finding NOT listed here fails the pipeline and blocks image build/push.
+# Each skip below was reviewed by hand against the first full checkov run
+# (35 findings) and is accepted for a short-lived, single-region student
+# sandbox, with the reason written next to it. Two findings were fixed in the
+# code instead (storage soft delete CKV2_AZURE_38, SAS expiry CKV2_AZURE_41).
+framework:
+  - terraform
+compact: true
+skip-check:
+  # --- Container Registry: Premium-only or multi-region features ----------
+  - CKV_AZURE_233   # zone redundancy: Premium SKU only
+  - CKV_AZURE_237   # dedicated data endpoints: Premium SKU only
+  - CKV_AZURE_164   # content trust / signed images: Premium SKU only
+  - CKV_AZURE_165   # geo-replication: Premium, single-region deployment
+  - CKV_AZURE_166   # quarantine: Premium; images are scanned by Docker Scout in CI before push instead
+  - CKV_AZURE_163   # Defender image scanning: paid; Docker Scout gate covers this
+  - CKV_AZURE_167   # untagged manifest retention: Premium SKU only
+  - CKV_AZURE_139   # private networking: GitHub-hosted runners push over the internet, no private endpoint in sandbox
+  # --- Key Vault: sandbox teardown and no private network -----------------
+  - CKV_AZURE_109   # firewall rules: operator and AKS reach the vault over public endpoint, no VNet in sandbox
+  - CKV_AZURE_189   # public network access: same reason as CKV_AZURE_109
+  - CKV2_AZURE_32   # private endpoint: no VNet/private DNS in sandbox
+  - CKV_AZURE_110   # purge protection: deliberately off so teardown can purge the vault the same day
+  - CKV_AZURE_42    # recoverable: soft delete IS on (7 days), check also requires purge protection, see above
+  # --- AKS: production-hardening features outside sandbox scope -----------
+  - CKV_AZURE_141   # local admin: disabling needs Entra ID cluster admin groups, not available on CloudLabs
+  - CKV_AZURE_226   # ephemeral OS disk: not supported by Standard_D2s_v3 default cache size
+  - CKV_AZURE_117   # disk encryption set: customer-managed keys out of scope (platform encryption is on)
+  - CKV_AZURE_227   # host encryption: needs subscription feature registration not allowed on CloudLabs
+  - CKV_AZURE_232   # system-only node pool: single pool keeps the sandbox to 2 nodes
+  - CKV_AZURE_170   # paid uptime SLA: cost
+  - CKV_AZURE_4     # Azure Monitor logging: Log Analytics workspace cost; Prometheus/Grafana covered in 10.2D
+  - CKV_AZURE_116   # Azure Policy add-on: needs policy provider registration not allowed on CloudLabs
+  - CKV_AZURE_7     # network policy: left for a later iteration, see CKV2_AZURE_29
+  - CKV2_AZURE_29   # Azure CNI: default kubenet kept to match Weeks 5 to 10 and avoid subnet sizing
+  - CKV_AZURE_6     # API server authorized IPs: GitHub runners and Argo CD need no API access, but operator IP is dynamic
+  - CKV_AZURE_115   # private cluster: operator runs kubectl from a home network
+  # --- Storage: app design constraints ------------------------------------
+  - CKV_AZURE_59    # public network access: browsers load photos through app-issued SAS URLs
+  - CKV_AZURE_206   # replication: LRS is sufficient for sandbox photo storage
+  - CKV_AZURE_33    # queue logging: queue service not used
+  - CKV2_AZURE_40   # shared key auth: current app code uses a connection string (see known limitation in storage_account.tf)
+  - CKV2_AZURE_33   # private endpoint: no VNet in sandbox
+  - CKV2_AZURE_1    # customer-managed key: platform-managed encryption is on
+  - CKV2_AZURE_21   # blob read logging: Log Analytics cost
